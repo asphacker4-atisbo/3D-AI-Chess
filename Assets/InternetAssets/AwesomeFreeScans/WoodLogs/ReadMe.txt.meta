@@ -1,0 +1,16 @@
+fileFormatVersion: 2
+guid: 5a6850af6ebcc304bbf19ae5fdb3035b
+timeCreated: 1527855364
+licenseType: Store
+TextScriptImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 216756
+  packageName: Awesome Free Scans - Wood Logs
+  packageVersion: 1.0
+  assetPath: Assets/AwesomeFreeScans/WoodLogs/ReadMe.txt
+  uploadId: 506820

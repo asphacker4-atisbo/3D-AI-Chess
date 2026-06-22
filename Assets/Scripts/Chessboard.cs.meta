@@ -1,0 +1,22 @@
+fileFormatVersion: 2
+guid: 113ff81f285314df9a82a4db4128a503
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences:
+  - tileMaterial: {fileID: 2100000, guid: 43d9aeb5befee456c9824c0d844a7e93, type: 2}
+  - hoverMaterial: {fileID: 2100000, guid: b0e9e3c538abe475b963afe72acd6978, type: 2}
+  - highlightMaterial: {fileID: 2100000, guid: c5782f2ebf61240168ac728d653e7d93, type: 2}
+  - checkMaterial: {fileID: 2100000, guid: 96d76b69123de4cc981ad1abe6438ad2, type: 2}
+  - victoryScreen: {instanceID: 0}
+  - whitePedestal: {instanceID: 0}
+  - blackPedestal: {instanceID: 0}
+  - cameraPivot: {instanceID: 0}
+  - timerText: {instanceID: 0}
+  - gameSceneCanvas: {instanceID: 0}
+  - boardMesh: {instanceID: 0}
+  executionOrder: 0
+  icon: {instanceID: 0}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
