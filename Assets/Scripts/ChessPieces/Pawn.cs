@@ -9,6 +9,12 @@ public class Pawn : ChessPiece
 
         int direction = (team == 0) ? 1 : -1;
 
+        // Guard: pawn at the last rank has no moves (happens during AI promotion simulation
+        // where type is temporarily swapped to Queen but the object is still a Pawn).
+        int nextY = currentY + direction;
+        if (nextY < 0 || nextY >= tileCountY)
+            return r;
+
         // One in front
         if (board[currentX, currentY + direction] == null)
             r.Add(new Vector2Int(currentX, currentY + direction));

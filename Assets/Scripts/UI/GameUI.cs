@@ -30,6 +30,10 @@ public class GameUI : MonoBehaviour
     public Toggle tipsToggle, autoSaveToggle, hoverToggle, invertToggle, musicToggle, movesToggle, timerToggle;
     [SerializeField] private TMP_Text ipField;
 
+    [Header("Save Slot Panel")]
+    [Tooltip("Cinzel or other rustic TMP font asset. Assign in Inspector so the save-slot panel matches the game's visual theme.")]
+    [SerializeField] private TMP_FontAsset rusticFont;
+
     [Header("AI Panel Configurations")]
     [SerializeField] private GameObject modeSelectionPanel; // Panel con botones: "Online" y "Contra IA"
     [SerializeField] private GameObject aiConfigurationPanel; // Panel con Slider de nivel y botón "Empezar"
@@ -47,12 +51,22 @@ public class GameUI : MonoBehaviour
     private string savePath;
     public static SaveSettings dataToLoad;
 
+    // Backing field for the AI level chosen in the config panel — used by OnAIGameSceneLoaded
+    private int _pendingAILevel = 1;
+
     private void Awake()
     {
         Instance = this;
         DontDestroyOnLoad(gameObject);
         savePath = Application.persistentDataPath + "/settings.json";
         RegisterEvents();
+        SaveSlotPanel.RusticFont = rusticFont;  // must be set before EnsureExists builds the UI
+        SaveSlotPanel.EnsureExists(); // creates the panel singleton if not already present
+    }
+
+    private void OnDestroy()
+    {
+        UnRegisterEvents();
     }
 
     public void OnApplyButton()
@@ -87,35 +101,75 @@ public class GameUI : MonoBehaviour
     // Buttons
     public void OnNewGameButton()
     {
+        SaveSlotManager.ClearSessionSlot(); // next game gets a fresh slot
         menuAnimator.SetTrigger("InGameMenu");
         SetLocalGame?.Invoke(true);
         server.Init(8007);
         client.Init("127.0.0.1", 8007);
     }
+    /// <summary>
+    /// Called by the "Continue / Load Game" button in the main menu.
+    /// Opens the slot selection panel so the player can pick which save to load.
+    /// </summary>
     public void OnContinueButton()
     {
-        // 1. Cargar datos antes de hacer nada
-        string path = Application.persistentDataPath + "/settings.json";
-        if (File.Exists(path))
+        SaveSlotPanel.Instance?.Open(slot => LoadFromSlot(slot));
+    }
+
+    /// <summary>
+    /// Opens the slot panel in Load mode — safe to call from any scene.
+    /// </summary>
+    public void OpenLoadPanel()
+    {
+        SaveSlotPanel.Instance?.Open(slot => LoadFromSlot(slot));
+    }
+
+    /// <summary>
+    /// Loads the save in <paramref name="slot"/> and transitions to the game scene.
+    /// Works from both the main menu and from within an active game.
+    /// </summary>
+    private void LoadFromSlot(int slot)
+    {
+        SaveSettings data = SaveSlotManager.LoadFromSlot(slot);
+        if (data == null)
         {
-            string json = EncryptionTool.LoadDecrypted(path);
-            dataToLoad = JsonUtility.FromJson<SaveSettings>(json);
+            Debug.LogWarning($"[SaveSlot] Slot {slot} is empty — nothing to load.");
+            return;
+        }
 
-            // 2. REUTILIZAR LA LÓGICA DE PARTIDA LOCAL (Esto es lo que quita el menú)
-            localGame = true;
-            currentTeam = 0; // O el equipo guardado
+        // Pin the session to this slot so auto-saves overwrite it going forward
+        SaveSlotManager.SetSessionSlot(slot);
 
-            // 3. ACTIVAR ANIMACIÓN (La misma que usas al darle a Play)
+        dataToLoad  = data;
+        localGame   = true;
+        currentTeam = 0;
+
+        if (data.isAIGame)
+        {
+            // Inject AI config into the freshly loaded Chessboard after the scene loads
+            _pendingAILevel = data.aiLevel;
+            SceneManager.sceneLoaded += OnAIGameSceneLoaded;
+        }
+        else
+        {
+            // Initialise local networking for two-player local games
+            SetLocalGame?.Invoke(true);
+            currentTeam = 0; // SetLocalGame resets currentTeam to -1; restore it
+            if (server != null && client != null)
+            {
+                server.ShutDown();
+                server.Init(8007);
+                client.ShutDown();
+                client.Init("127.0.0.1", 8007);
+            }
+        }
+
+        // Trigger the "entering game" menu animation only when we are on the main menu
+        if (UnityEngine.SceneManagement.SceneManager.GetActiveScene().name != "GameScene")
             menuAnimator.SetTrigger("InGameMenu");
 
-            // 4. CAMBIAR ESCENA
-            SceneManager.LoadScene("GameScene");
-
-            // 5. ESTO ES VITAL: Suscribirse al evento para configurar la cámara y limpiar UI
-            SceneManager.sceneLoaded += OnSceneLoaded;
-
-            Debug.Log("Continuando partida: Se ha activado el trigger InGame y suscrito OnSceneLoaded.");
-        }
+        SceneManager.sceneLoaded += OnSceneLoaded;
+        SceneManager.LoadScene("GameScene");
     }
     public void OnMultiplayerButton()
     {
@@ -158,24 +212,39 @@ public class GameUI : MonoBehaviour
     public void OnStartAIGameButton()
     {
         aiConfigurationPanel.SetActive(false);
-        
-        int levelChosen = aiLevelSlider != null ? Mathf.Clamp((int)aiLevelSlider.value, 1, 8) : 1;
-        
-        localGame = true; 
-        currentTeam = 0; // El jugador humano será el equipo Blanco (0)
 
-        // Suscribirse temporalmente al evento de carga de escena para inyectar datos en el Chessboard
-        SceneManager.sceneLoaded += (scene, mode) => {
-            if (scene.name == "GameScene")
-            {
-                Chessboard.Instance.isAIGame = true;
-                Chessboard.Instance.aiLevel = levelChosen;
-                Chessboard.Instance.aiTeam = 1; // La IA será el equipo Negro (1)
-            }
-        };
+        _pendingAILevel = aiLevelSlider != null ? Mathf.Clamp((int)aiLevelSlider.value, 1, 8) : 1;
+
+        localGame   = true;
+        currentTeam = 0; // Human always plays White
+
+        SaveSlotManager.ClearSessionSlot(); // fresh slot for this new AI game
+
+        // Use a named handler so it can be properly unregistered after firing once
+        SceneManager.sceneLoaded += OnAIGameSceneLoaded;
+        SceneManager.sceneLoaded += OnSceneLoaded;
 
         menuAnimator.SetTrigger("InGameMenu");
         SceneManager.LoadScene("GameScene");
+    }
+
+    /// <summary>
+    /// Fires once when the GameScene finishes loading for a new AI game.
+    /// Injects AI configuration into the freshly created Chessboard instance,
+    /// then unregisters itself so it never fires again.
+    /// </summary>
+    private void OnAIGameSceneLoaded(Scene scene, LoadSceneMode mode)
+    {
+        if (scene.name != "GameScene") return;
+
+        SceneManager.sceneLoaded -= OnAIGameSceneLoaded;
+
+        if (Chessboard.Instance != null)
+        {
+            Chessboard.Instance.isAIGame = true;
+            Chessboard.Instance.aiLevel  = _pendingAILevel;
+            Chessboard.Instance.aiTeam   = 1; // AI always plays Black
+        }
     }
 
     public void OnAILobbyBackButton()
@@ -396,48 +465,38 @@ public class GameUI : MonoBehaviour
     }
     private IEnumerator SetupCamera()
     {
-        // ------------------------------------
-        // DETECCIÓN DE PARTIDA CARGADA
-        // ------------------------------------
+        if (Chessboard.Instance == null) yield break;
+
+        // ── Continuing a saved game ────────────────────────────────────────────
         if (dataToLoad != null && dataToLoad.moveHistory != null && dataToLoad.moveHistory.Count > 0)
         {
-            Debug.Log("Carga: Detectada partida cargada. Ajustando cámara al turno guardado.");
-
-            // NUEVA CONDICIÓN: Si es una partida de IA, NO invertimos la cámara bajo ningún concepto
-            if (Chessboard.Instance != null && Chessboard.Instance.isAIGame)
+            // AI games: human is always White — keep the white-side camera
+            if (dataToLoad.isAIGame)
             {
-                Debug.Log("Carga: Es partida contra IA, ignorando inversión de tablero.");
                 Chessboard.Instance.ChangeCamera(CameraAngle.whiteTeam);
                 yield break;
             }
 
-            // Lógica original para partidas normales locales
+            // Local game: rotate to black's perspective if it was their turn and invert is on
             if (dataToLoad.invertBoardForBlackEnabled && !dataToLoad.isWhiteTurn)
             {
-                Debug.Log("Carga: Es turno de negras, rotando cámara automáticamente...");
                 yield return new WaitForEndOfFrame();
                 Chessboard.Instance.StartCoroutine(Chessboard.Instance.RotateCamera(true));
-                yield break; 
+                yield break;
             }
-        }
-        // ------------------------------------
 
-        // Lógica normal para New Game o Online
+            // Otherwise stay on white's side
+            Chessboard.Instance.ChangeCamera(CameraAngle.whiteTeam);
+            yield break;
+        }
+
+        // ── Starting a new game ────────────────────────────────────────────────
         if (!localGame && currentTeam != -1)
-        {
             Chessboard.Instance.SetInvertBoard(false);
-        }
 
-        // Si es juego contra IA, forzamos que el jugador humano siempre mire desde el bando blanco
-        if (Chessboard.Instance != null && Chessboard.Instance.isAIGame)
-        {
+        if (currentTeam == 0)
             Chessboard.Instance.ChangeCamera(CameraAngle.whiteTeam);
-        }
-        else if (currentTeam == 0) // Blanco normal
-        {
-            Chessboard.Instance.ChangeCamera(CameraAngle.whiteTeam);
-        }
-        else if (currentTeam == 1) // Negro normal
+        else if (currentTeam == 1)
         {
             yield return new WaitForEndOfFrame();
             Chessboard.Instance.StartCoroutine(Chessboard.Instance.RotateCamera(true));

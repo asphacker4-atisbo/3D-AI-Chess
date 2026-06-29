@@ -5229,6 +5229,7 @@ MonoBehaviour:
   movesToggle: {fileID: 1546400130}
   timerToggle: {fileID: 650909975}
   ipField: {fileID: 113572970}
+  rusticFont: {fileID: 11400000, guid: 6820b2cebc4e04e8991e51c35744435d, type: 2}
   modeSelectionPanel: {fileID: 2124932623}
   aiConfigurationPanel: {fileID: 1741615366}
   aiLevelSlider: {fileID: 1786854061}

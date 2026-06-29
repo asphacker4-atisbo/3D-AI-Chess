@@ -139,7 +139,9 @@ public class ChessAI : MonoBehaviour
 
     private struct MoveUndo
     {
-        public ChessPiece Captured;
+        public ChessPiece     Captured;
+        public ChessPieceType MovedType;        // Original type before search-time promotion
+        public ChessPiece     EnPassantCapture; // Pawn removed for en passant
     }
 
     // ══════════════════════════════════════
@@ -481,25 +483,26 @@ public class ChessAI : MonoBehaviour
 
         const float DELTA = 200f;
 
-        var allMoves = GetAllRawMoves(board, turn);
-        _scoredMoveBuffer.Clear();
+        // Allocate a fresh list here to avoid corrupting the shared buffer in recursive calls
+        var allMoves = new List<Vector2Int[]>(GetAllRawMoves(board, turn));
+        var localScored = new List<ScoredMove>(allMoves.Count);
         for (int i = 0; i < allMoves.Count; i++)
         {
             var move = allMoves[i];
             ChessPiece vic = board[move[1].x, move[1].y];
             if (vic == null) continue;
             ChessPiece att = board[move[0].x, move[0].y];
-            _scoredMoveBuffer.Add(new ScoredMove
+            localScored.Add(new ScoredMove
             {
                 Move = move, IsCapture = true,
                 Score = PieceVal(vic.type) * 10 - PieceVal(att.type)
             });
         }
-        _scoredMoveBuffer.Sort((a, b) => b.Score.CompareTo(a.Score));
+        localScored.Sort((a, b) => b.Score.CompareTo(a.Score));
 
-        for (int ci = 0; ci < _scoredMoveBuffer.Count; ci++)
+        for (int ci = 0; ci < localScored.Count; ci++)
         {
-            var move = _scoredMoveBuffer[ci].Move;
+            var move = localScored[ci].Move;
             ChessPiece vic = board[move[1].x, move[1].y];
 
             // Delta pruning
@@ -848,9 +851,35 @@ public class ChessAI : MonoBehaviour
 
     private static void MakeMove(ChessPiece[,] board, Vector2Int[] move, out MoveUndo undo)
     {
-        undo.Captured = board[move[1].x, move[1].y];
-        board[move[1].x, move[1].y] = board[move[0].x, move[0].y];
+        ChessPiece moving = board[move[0].x, move[0].y];
+        undo.Captured        = board[move[1].x, move[1].y];
+        undo.MovedType        = moving?.type ?? ChessPieceType.None;
+        undo.EnPassantCapture = null;
+
+        board[move[1].x, move[1].y] = moving;
         board[move[0].x, move[0].y] = null;
+
+        if (moving != null)
+        {
+            moving.currentX = move[1].x;
+            moving.currentY = move[1].y;
+
+            if (moving.type == ChessPieceType.Pawn)
+            {
+                // En passant: diagonal pawn capture onto an empty square
+                if (move[0].x != move[1].x && undo.Captured == null)
+                {
+                    undo.EnPassantCapture = board[move[1].x, move[0].y];
+                    board[move[1].x, move[0].y] = null;
+                }
+                // Promotion: temporarily treat the pawn as a queen for evaluation
+                else if ((moving.team == 0 && move[1].y == 7) ||
+                         (moving.team == 1 && move[1].y == 0))
+                {
+                    moving.type = ChessPieceType.Queen;
+                }
+            }
+        }
     }
 
     private static void UnmakeMove(ChessPiece[,] board, Vector2Int[] move, in MoveUndo undo)
@@ -858,6 +887,25 @@ public class ChessAI : MonoBehaviour
         ChessPiece moved = board[move[1].x, move[1].y];
         board[move[0].x, move[0].y] = moved;
         board[move[1].x, move[1].y] = undo.Captured;
+
+        if (moved != null)
+        {
+            moved.currentX = move[0].x;
+            moved.currentY = move[0].y;
+            moved.type     = undo.MovedType; // Restore type in case of promotion swap
+        }
+        if (undo.Captured != null)
+        {
+            undo.Captured.currentX = move[1].x;
+            undo.Captured.currentY = move[1].y;
+        }
+        // Restore en-passant captured pawn
+        if (undo.EnPassantCapture != null)
+        {
+            board[move[1].x, move[0].y]       = undo.EnPassantCapture;
+            undo.EnPassantCapture.currentX = move[1].x;
+            undo.EnPassantCapture.currentY = move[0].y;
+        }
     }
 
     private static void PromoteRootMove(List<ScoredMove> rootMoves, Vector2Int[] best)

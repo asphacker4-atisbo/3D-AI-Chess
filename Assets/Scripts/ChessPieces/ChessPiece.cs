@@ -26,9 +26,12 @@ public class ChessPiece : MonoBehaviour
     private float hoverHeight = 0.35f; // Cuánto se eleva al pasar el ratón
     private float smoothSpeed = 12f;
 
-    private void Start()
+    private void Awake()
     {
-        desiredScale = transform.localScale;    
+        // Initialise desiredScale here (Awake) rather than Start so that external
+        // code running in Chessboard.Start — such as the save-game replay which calls
+        // SetScale on captured pieces — is never overwritten by a later Start() call.
+        desiredScale = transform.localScale;
     }
     private void Update()
     {

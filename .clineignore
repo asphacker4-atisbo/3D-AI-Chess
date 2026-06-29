@@ -1,0 +1,27 @@
+# Ignorar carpetas pesadas y temporales de Unity
+/[lL]ibrary/
+/[temp]/
+/[obj]/
+/[Logs]/
+/[UserSettings]/
+/[Builds]/
+/Build/
+
+# Ignorar archivos generados por VS/VS Code
+/.vs/
+/.vscode/
+/*.sln
+/*.csproj
+
+# Ignorar assets multimedia pesados que la IA no necesita leer
+*.unity
+*.asset
+*.prefab
+*.mat
+*.png
+*.jpg
+*.jpeg
+*.fbx
+*.obj
+*.mp3
+*.wav

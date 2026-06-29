@@ -106,6 +106,13 @@ public class Chessboard : MonoBehaviour
     [SerializeField] private GameObject[] cameraAngles;
     private bool isLoadingLevel = false;
 
+    // Cached check state — updated only after real moves on the main thread to avoid
+    // a data race with the AI background thread (MakeMove/UnmakeMove mutate currentX/Y
+    // on shared ChessPiece objects; reading them every frame in UpdateTileMaterials
+    // caused both king tiles to flicker red intermittently).
+    private bool _whiteKingInCheck;
+    private bool _blackKingInCheck;
+
     // Cameras
     public void ChangeCamera(CameraAngle index)
     {
@@ -183,6 +190,9 @@ public class Chessboard : MonoBehaviour
                 return; // Bloquea el resto del Update (raycasts del jugador) mientras la IA piensa
             }
         }
+
+        // Block all mouse interaction while the camera is animating between sides
+        if (isCameraRotating) return;
 
         RaycastHit info;
         Vector2 mousePosition = Mouse.current.position.ReadValue();
@@ -390,40 +400,54 @@ public class Chessboard : MonoBehaviour
                 GameObject tile = tiles[x, y];
                 MeshRenderer renderer = tile.GetComponent<MeshRenderer>();
                 int layer = tile.layer;
-                bool isKingInCheck = false;
 
-                // Check Logic
-                if (whiteKing != null && x == whiteKing.currentX && y == whiteKing.currentY && IsSquareAttacked(new Vector2Int(x, y), 1))
-                    isKingInCheck = true;
-                if (blackKing != null && x == blackKing.currentX && y == blackKing.currentY && IsSquareAttacked(new Vector2Int(x, y), 0))
-                    isKingInCheck = true;
+                // Use the cached check state — never call IsSquareAttacked here.
+                // IsSquareAttacked reads ChessPiece.currentX/Y which the AI background
+                // thread mutates during search; reading per-frame caused a data race.
+                bool isKingInCheck =
+                    (whiteKing != null && x == whiteKing.currentX && y == whiteKing.currentY && _whiteKingInCheck) ||
+                    (blackKing != null && x == blackKing.currentX && y == blackKing.currentY && _blackKingInCheck);
 
                 if (isKingInCheck)
                 {
                     renderer.material = checkMaterial;
                 }
-                else if (tile.layer == LayerMask.NameToLayer("Highlight") && showPossibleMovesEnabled)
+                else if (layer == LayerMask.NameToLayer("Highlight") && showPossibleMovesEnabled)
                 {
                     renderer.material = highlightMaterial;
                 }
-
-                if (layer == LayerMask.NameToLayer("Highlight") && showPossibleMovesEnabled)
-                {
-                    if (renderer.material != highlightMaterial)
-                        renderer.material = highlightMaterial;
-                }
                 else if (layer == LayerMask.NameToLayer("Hover") && hoverTilesEnabled)
                 {
-                    if (renderer.material != hoverMaterial)
-                        renderer.material = hoverMaterial;
+                    renderer.material = hoverMaterial;
                 }
-                else if (!isKingInCheck)
+                else
                 {
-                    if (renderer.material != tileMaterial)
-                        renderer.material = tileMaterial;
+                    renderer.material = tileMaterial;
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Recomputes and caches which kings are in check.
+    /// Must only be called from the main thread, after a real move has been
+    /// committed to <see cref="chessPieces"/>, so that the AI background thread
+    /// is idle and <see cref="IsSquareAttacked"/> reads a stable board state.
+    /// </summary>
+    private void RefreshCheckState()
+    {
+        ChessPiece wk = null, bk = null;
+        foreach (var p in chessPieces)
+        {
+            if (p == null) continue;
+            if (p.type == ChessPieceType.King)
+            {
+                if (p.team == 0) wk = p;
+                else             bk = p;
+            }
+        }
+        _whiteKingInCheck = wk != null && IsSquareAttacked(new Vector2Int(wk.currentX, wk.currentY), 1);
+        _blackKingInCheck = bk != null && IsSquareAttacked(new Vector2Int(bk.currentX, bk.currentY), 0);
     }
     private void HighlightTiles()
     {
@@ -468,7 +492,7 @@ public class Chessboard : MonoBehaviour
             chessPieces[6, 0] = SpawnSinglePiece(ChessPieceType.Knight, whiteTeam);
         }
         chessPieces[7, 0] = SpawnSinglePiece(ChessPieceType.Rook, whiteTeam);
-        if (!debugRemovePawns || !testCastling)
+        if (!debugRemovePawns)
         {
             for (int i = 0; i < TILE_COUNT_X; i++)
                 chessPieces[i, 1] = SpawnSinglePiece(ChessPieceType.Pawn, whiteTeam);
@@ -488,7 +512,7 @@ public class Chessboard : MonoBehaviour
             chessPieces[6, 7] = SpawnSinglePiece(ChessPieceType.Knight, blackTeam);
         }
         chessPieces[7, 7] = SpawnSinglePiece(ChessPieceType.Rook, blackTeam);
-        if (!debugRemovePawns || !testCastling)
+        if (!debugRemovePawns)
         {
             for (int i = 0; i < TILE_COUNT_X; i++)
                 chessPieces[i, 6] = SpawnSinglePiece(ChessPieceType.Pawn, blackTeam);
@@ -545,12 +569,19 @@ public class Chessboard : MonoBehaviour
     // Checkmate
     private void CheckMate(int team)
     {
+        // Free the save slot — a finished game doesn't need to stay saved
+        int sessionSlot = SaveSlotManager.GetOrCreateSessionSlot();
+        if (SaveSlotManager.SlotExists(sessionSlot))
+            SaveSlotManager.DeleteSlot(sessionSlot);
+
         DisplayVictory(team);
     }
     private void DisplayVictory(int winningTeam)
     {
         victoryScreen.SetActive(true);
-        victoryScreen.transform.GetChild(winningTeam).gameObject.SetActive(true);
+        // winningTeam == -1 signals a draw/stalemate: show the overlay without a winner banner
+        if (winningTeam >= 0)
+            victoryScreen.transform.GetChild(winningTeam).gameObject.SetActive(true);
         victoryScreen.transform.GetChild(2).gameObject.SetActive(true);
         victoryScreen.transform.GetChild(3).gameObject.SetActive(true);
 
@@ -559,6 +590,13 @@ public class Chessboard : MonoBehaviour
     }
     public void OnRematchButton()
     {
+        // AI games never initialise the network stack — trigger rematch directly
+        if (isAIGame)
+        {
+            GameReset();
+            return;
+        }
+
         if (GameUI.Instance.localGame)
         {
             NetRematch wrm = new()
@@ -589,6 +627,9 @@ public class Chessboard : MonoBehaviour
     {
         Time.timeScale = 1.0f;
         Time.fixedDeltaTime = 0.02f;
+
+        // Ensure the AI coroutine flag is cleared so the AI can move again after rematch
+        isAIThinking = false;
 
         rematchButton.interactable = true;
         menuButton.interactable = true;
@@ -635,13 +676,18 @@ public class Chessboard : MonoBehaviour
         SpawnAllPieces();
         PositionAllPieces();
         isWhiteTurn = true;
+        _whiteKingInCheck = false;
+        _blackKingInCheck = false;
     }
     public void OnMenuButton()
     {
-        NetRematch rm = new() { teamId = GameUI.Instance.currentTeam, wantRematch = 0 };
-        Client.Instance.SendToServer(rm);
-
-        ShutDownRelay();
+        // AI games never initialise the network stack, so skip all net calls
+        if (!isAIGame)
+        {
+            NetRematch rm = new() { teamId = GameUI.Instance.currentTeam, wantRematch = 0 };
+            Client.Instance.SendToServer(rm);
+            ShutDownRelay();
+        }
 
         GameReset();
 
@@ -670,6 +716,7 @@ public class Chessboard : MonoBehaviour
                     {
                         deadWhites.Add(enemyPawn);
                         SendToPedestal(enemyPawn, 0);
+                        chessPieces[enemyPawn.currentX, enemyPawn.currentY] = null;
                     }
                     else
                     {
@@ -813,14 +860,21 @@ public class Chessboard : MonoBehaviour
 
         foreach (var move in movesToRemove) moves.Remove(move);
     }
-    private bool CheckForCheckmate()
+    /// <summary>
+    /// Checks whether the position after the last move is checkmate or stalemate.
+    /// Calls CheckMate with the winning team (or -1 for stalemate/draw) and returns
+    /// true when the game has ended so the caller can stop further processing.
+    /// </summary>
+    private bool CheckGameEnd()
     {
-        var lastMove = moveList[moveList.Count - 1];
-        int targetTeam = (chessPieces[lastMove[1].x, lastMove[1].y].team == 0) ? 1 : 0;
+        var lastMove  = moveList[moveList.Count - 1];
+        int movedTeam = chessPieces[lastMove[1].x, lastMove[1].y].team;
+        int targetTeam = 1 - movedTeam; // Team that must now respond
 
         List<ChessPiece> attackingPieces = new();
         List<ChessPiece> defendingPieces = new();
         ChessPiece targetKing = null;
+
         for (int x = 0; x < TILE_COUNT_X; x++)
             for (int y = 0; y < TILE_COUNT_Y; y++)
                 if (chessPieces[x, y] != null)
@@ -832,35 +886,46 @@ public class Chessboard : MonoBehaviour
                             targetKing = chessPieces[x, y];
                     }
                     else
-                    {
                         attackingPieces.Add(chessPieces[x, y]);
-                    }
-
                 }
 
-        // Is the king attacked right now?
-        List<Vector2Int> currentAvailableMoves = new();
+        if (targetKing == null) return false;
+
+        // Build all squares the attacker currently controls
+        List<Vector2Int> attackedSquares = new();
         for (int i = 0; i < attackingPieces.Count; i++)
         {
             var pieceMoves = attackingPieces[i].GetAvailableMoves(ref chessPieces, TILE_COUNT_X, TILE_COUNT_Y);
             for (int b = 0; b < pieceMoves.Count; b++)
-                currentAvailableMoves.Add(pieceMoves[b]);
+                attackedSquares.Add(pieceMoves[b]);
         }
 
-        // Are we in check right now?
-        if (ContainsValidMove(ref currentAvailableMoves, new Vector2Int(targetKing.currentX, targetKing.currentY)))
+        bool kingInCheck = ContainsValidMove(ref attackedSquares,
+            new Vector2Int(targetKing.currentX, targetKing.currentY));
+
+        // Check whether the defending team has at least one legal move left
+        bool hasLegalMove = false;
+        for (int i = 0; i < defendingPieces.Count; i++)
         {
-            // King is under attack, can we move something to help him?
-            for (int i = 0; i < defendingPieces.Count; i++)
+            List<Vector2Int> moves = defendingPieces[i].GetAvailableMoves(ref chessPieces, TILE_COUNT_X, TILE_COUNT_Y);
+            defendingPieces[i].GetSpecialMoves(ref chessPieces, ref moveList, ref moves);
+            SimulateMoveForSinglePiece(defendingPieces[i], ref moves, targetKing);
+            if (moves.Count > 0) { hasLegalMove = true; break; }
+        }
+
+        if (!hasLegalMove)
+        {
+            if (kingInCheck)
             {
-                List<Vector2Int> defendingMoves = defendingPieces[i].GetAvailableMoves(ref chessPieces, TILE_COUNT_X, TILE_COUNT_Y);
-                SimulateMoveForSinglePiece(defendingPieces[i], ref defendingMoves, targetKing);
-
-                if (defendingMoves.Count != 0)
-                    return false;
+                Debug.Log($"Checkmate! Team {movedTeam} wins.");
+                CheckMate(movedTeam); // The side that just moved wins
             }
-
-            return true; // Checkmate Exit
+            else
+            {
+                Debug.Log("Stalemate — draw.");
+                CheckMate(-1); // Draw: pass -1 so DisplayVictory shows no winner
+            }
+            return true;
         }
 
         return false;
@@ -910,22 +975,13 @@ public class Chessboard : MonoBehaviour
             if (cp.team == ocp.team)
                 return;
 
-            if (cp.team == ocp.team)
-                return;
-
             if (ocp.team == 0)
             {
-                if (ocp.type == ChessPieceType.King)
-                    return;
-
                 deadWhites.Add(ocp);
                 SendToPedestal(ocp, 0);
             }
             else
             {
-                if (ocp.type == ChessPieceType.King)
-                    return;
-
                 deadBlacks.Add(ocp);
                 SendToPedestal(ocp, 1);
             }
@@ -956,8 +1012,12 @@ public class Chessboard : MonoBehaviour
             currentlyDragging = null;
         RemoveHighlightTiles();
 
-        if (CheckForCheckmate())
-            CheckMate(cp.team);
+        // Skip end-of-game detection while replaying a saved game move-by-move
+        if (!isLoadingLevel)
+        {
+            CheckGameEnd();
+            RefreshCheckState(); // update cached king-in-check flags (safe: AI is idle here)
+        }
 
         if (GameUI.Instance.localGame && !isLoadingLevel)
         {
@@ -1054,21 +1114,23 @@ public class Chessboard : MonoBehaviour
     {
         SaveSettings data = new()
         {
-            hoverTilesEnabled = this.hoverTilesEnabled,
-            showPossibleMovesEnabled = this.showPossibleMovesEnabled,
+            hoverTilesEnabled          = this.hoverTilesEnabled,
+            showPossibleMovesEnabled   = this.showPossibleMovesEnabled,
             invertBoardForBlackEnabled = this.invertBoardForBlackEnabled,
-            useTimer = this.useTimer,
-            playerTimeMinutes = this.playerTimeMinutes,
+            useTimer                   = this.useTimer,
+            playerTimeMinutes          = this.playerTimeMinutes,
 
             isWhiteTurn = this.isWhiteTurn,
-            whiteTime = this.whiteTime,
-            blackTime = this.blackTime
+            whiteTime   = this.whiteTime,
+            blackTime   = this.blackTime,
+
+            isAIGame = this.isAIGame,
+            aiLevel  = this.aiLevel,
+            aiTeam   = this.aiTeam
         };
 
         foreach (Vector2Int[] move in moveList)
-        {
             data.moveHistory.Add($"{move[0].x}{move[0].y}{move[1].x}{move[1].y}");
-        }
 
         return data;
     }
@@ -1077,63 +1139,88 @@ public class Chessboard : MonoBehaviour
     {
         isLoadingLevel = true;
 
-        this.whiteTime = data.whiteTime;
-        this.blackTime = data.blackTime;
+        // Restore AI configuration first — move replay may depend on these flags
+        this.isAIGame = data.isAIGame;
+        this.aiLevel  = data.aiLevel;
+        this.aiTeam   = data.aiTeam;
+
+        // Restore timer state
+        this.whiteTime   = data.whiteTime;
+        this.blackTime   = data.blackTime;
         this.isWhiteTurn = data.isWhiteTurn;
 
+        // Make sure GameUI reflects the restored game type
+        if (GameUI.Instance != null)
+        {
+            GameUI.Instance.localGame   = true;
+            // For AI games the human is always team 0; keep currentTeam stable
+            if (data.isAIGame)
+                GameUI.Instance.currentTeam = 0;
+        }
+
+        // Replay each stored move to reconstruct the full board position
         foreach (string moveStr in data.moveHistory)
         {
+            if (moveStr.Length < 4) continue;
             int x1 = (int)char.GetNumericValue(moveStr[0]);
             int y1 = (int)char.GetNumericValue(moveStr[1]);
             int x2 = (int)char.GetNumericValue(moveStr[2]);
             int y2 = (int)char.GetNumericValue(moveStr[3]);
-
             MoveTo(x1, y1, x2, y2);
         }
 
+        // Override the turn that the replay settled on with the authoritative saved value
         isWhiteTurn = data.isWhiteTurn;
 
+        // After replay the currentTeam toggles with each move; restore the correct value
+        if (GameUI.Instance != null && data.isAIGame)
+            GameUI.Instance.currentTeam = 0;
+
         isLoadingLevel = false;
+
+        // Recompute check state now that the full board is restored
+        RefreshCheckState();
     }
 
     public void AutoSaveGame()
     {
         SaveSettings data = new SaveSettings();
 
-        // 1. Guardar preferencias actuales
-        data.hoverTilesEnabled = this.hoverTilesEnabled;
-        data.showPossibleMovesEnabled = this.showPossibleMovesEnabled;
-        
-        // MODIFICACIÓN: Si es juego con IA, guardamos la opción de invertir siempre en FALSE
+        // 1. Current user preferences
+        data.hoverTilesEnabled          = this.hoverTilesEnabled;
+        data.showPossibleMovesEnabled   = this.showPossibleMovesEnabled;
         data.invertBoardForBlackEnabled = this.isAIGame ? false : this.invertBoardForBlackEnabled;
-        
-        data.useTimer = this.useTimer;
-        data.playerTimeMinutes = this.playerTimeMinutes;
+        data.useTimer                   = this.useTimer;
+        data.playerTimeMinutes          = this.playerTimeMinutes;
 
-        // 2. Guardar estado
+        // 2. Game state
         data.isWhiteTurn = this.isWhiteTurn;
-        data.whiteTime = this.whiteTime;
-        data.blackTime = this.blackTime;
+        data.whiteTime   = this.whiteTime;
+        data.blackTime   = this.blackTime;
 
-        // 3. Guardar movimientos
+        // 3. AI configuration — required so "Continue" restores AI mode
+        data.isAIGame = this.isAIGame;
+        data.aiLevel  = this.aiLevel;
+        data.aiTeam   = this.aiTeam;
+
+        // 4. Move history
         foreach (Vector2Int[] move in moveList)
-        {
             data.moveHistory.Add($"{move[0].x}{move[0].y}{move[1].x}{move[1].y}");
-        }
 
-        // El resto de tu código de guardado con criptografía se queda igual...
-        string json = JsonUtility.ToJson(data, true);
-        string path = Application.persistentDataPath + "/autosave.json";
-        EncryptionTool.SaveEncrypted(json, path);
+        // 5. Write to the session slot (picks first empty / oldest if all full)
+        int slot = SaveSlotManager.GetOrCreateSessionSlot();
+        SaveSlotManager.SaveToSlot(slot, data);
     }
 
     private async void TriggerAIMove()
     {
         isAIThinking = true;
-        Debug.Log($"[MCTS Engine] Procesando árbol de simulaciones en segundo plano para nivel {aiLevel}...");
+        Debug.Log($"[ChessAI] Searching at level {aiLevel}...");
 
-        // Llamamos al método asíncrono limpio que guardaste en el paso 2
         Vector2Int[] chosenMove = await ChessAI.Instance.GetBestMoveAsync(chessPieces, aiTeam, aiLevel);
+
+        // The board state may have changed while awaiting (e.g. scene unloaded)
+        if (this == null || isLoadingLevel) { isAIThinking = false; return; }
 
         if (chosenMove != null && chosenMove.Length == 2)
         {
@@ -1143,22 +1230,25 @@ public class Chessboard : MonoBehaviour
             int dY = chosenMove[1].y;
 
             ChessPiece aiPiece = chessPieces[oX, oY];
-            
-            // Forzar el cálculo de movimientos disponibles y movimientos especiales 
-            // de la pieza elegida para evitar que MoveTo rechace la jugada por falta de contexto
-            availableMoves = aiPiece.GetAvailableMoves(ref chessPieces, TILE_COUNT_X, TILE_COUNT_Y);
-            specialMove = aiPiece.GetSpecialMoves(ref chessPieces, ref moveList, ref availableMoves);
+            if (aiPiece == null)
+            {
+                Debug.LogWarning($"[ChessAI] No piece found at ({oX},{oY}). Skipping move.");
+                isAIThinking = false;
+                return;
+            }
 
-            Debug.Log($"[MCTS Engine] Movimiento óptimo encontrado: de ({oX},{oY}) a ({dX},{dY})");
-            
-            // Ejecutamos el movimiento en el tablero principal
+            // Populate specialMove so ProcessSpecialMove handles castling/promotion correctly
+            availableMoves = aiPiece.GetAvailableMoves(ref chessPieces, TILE_COUNT_X, TILE_COUNT_Y);
+            specialMove    = aiPiece.GetSpecialMoves(ref chessPieces, ref moveList, ref availableMoves);
+
+            Debug.Log($"[ChessAI] Move chosen: ({oX},{oY}) → ({dX},{dY})");
             MoveTo(oX, oY, dX, dY);
         }
         else
         {
-            Debug.LogWarning("[MCTS Engine] No se encontraron movimientos válidos. Posible Jaque Mate o Tablas.");
+            Debug.LogWarning("[ChessAI] No valid move found — possible checkmate or stalemate.");
         }
-        
+
         isAIThinking = false;
     }
 }
