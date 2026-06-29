@@ -1013,13 +1013,14 @@ public class Chessboard : MonoBehaviour
         RemoveHighlightTiles();
 
         // Skip end-of-game detection while replaying a saved game move-by-move
+        bool gameEnded = false;
         if (!isLoadingLevel)
         {
-            CheckGameEnd();
+            gameEnded = CheckGameEnd();
             RefreshCheckState(); // update cached king-in-check flags (safe: AI is idle here)
         }
 
-        if (GameUI.Instance.localGame && !isLoadingLevel)
+        if (GameUI.Instance.localGame && !isLoadingLevel && !gameEnded)
         {
             AutoSaveGame();
             Debug.Log("Partida guardada automáticamente tras el movimiento.");

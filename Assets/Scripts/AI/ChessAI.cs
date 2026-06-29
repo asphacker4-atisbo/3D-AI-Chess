@@ -7,9 +7,7 @@ using UnityEngine;
 
 /// <summary>
 /// Motor de ajedrez híbrido de alto rendimiento — 8 niveles de dificultad.
-/// Niveles 1-2 : MCTS puro (errores intencionados, nivel principiante/casual).
-/// Niveles 3-8 : Negamax + Alpha-Beta + LMR + Null Move + Transposition Table.
-/// El nivel 8 alcanza profundidades de 10-12+ ply con todas las optimizaciones activas.
+/// Optimizado con Zero-GC local buffers, Tapered Eval, Check Extensions y King Safety.
 /// </summary>
 public class ChessAI : MonoBehaviour
 {
@@ -18,21 +16,10 @@ public class ChessAI : MonoBehaviour
     // ══════════════════════════════════════
     //  CONFIGURACIÓN POR NIVEL (8 niveles)
     // ══════════════════════════════════════
-
-    // Nivel 1: MCTS 120 sims  — comete blunders graves
-    // Nivel 2: MCTS 300 sims  — comete errores frecuentes
-    // Nivel 3: Negamax 3 ply  — principiante sólido
-    // Nivel 4: Negamax 4 ply  — intermedio
-    // Nivel 5: Negamax 5 ply  — intermedio-avanzado
-    // Nivel 6: Negamax 7 ply  — avanzado
-    // Nivel 7: Negamax 9 ply  — experto / ELO ~2000
-    // Nivel 8: Negamax ~8-10 ply en 3s — fuerte / ELO ~2200+
-
     private static readonly int[]  MCTSSimulations = { 0, 120,  300,  0,    0,    0,    0,    0,    0 };
     private static readonly int[]  NegamaxMaxDepth = { 0, 0,    0,    3,    4,    5,    7,    9,    16 };
     private static readonly int[]  TimeLimitMs     = { 0, 0,    0,    300,  500,  1000, 2000, 5000, 3000 };
 
-    // Constantes del motor
     private const float MATE_SCORE       = 100000f;
     private const float DRAW_SCORE       = 0f;
     private const float C_PUCT           = 1.2f;
@@ -41,6 +28,7 @@ public class ChessAI : MonoBehaviour
     private const int   NULL_MOVE_R      = 2;
     private const int   LMR_MIN_DEPTH    = 3;
     private const int   LMR_MIN_MOVES    = 3;
+    private const int   MAX_PLY          = 64;        // Límite máximo de profundidad para los buffers
 
     // ══════════════════════════════════════
     //  PSQT — PERSPECTIVA BLANCAS (fila 0 = rango 1)
@@ -117,7 +105,7 @@ public class ChessAI : MonoBehaviour
     };
 
     // ══════════════════════════════════════
-    //  TRANSPOSITION TABLE
+    //  TRANSPOSITION TABLE & STRUCTS
     // ══════════════════════════════════════
     private struct TTEntry
     {
@@ -129,25 +117,34 @@ public class ChessAI : MonoBehaviour
     }
     private static readonly TTEntry[] _tt = new TTEntry[TT_SIZE];
 
-    // ══════════════════════════════════════
-    //  KILLER MOVES & HISTORY HEURISTIC
-    // ══════════════════════════════════════
-    private Vector2Int[][] _killerMoves;    // [ply][slot*2] — guarda from+to
-    private int[,,,]       _historyTable;   // [team][fromX][fromY][toX*8+toY]
-    private readonly List<Vector2Int[]> _rawMoveBuffer = new(64);
-    private readonly List<ScoredMove>   _scoredMoveBuffer = new(64);
+    private struct ScoredMove
+    {
+        public Vector2Int[] Move;
+        public float        Score;
+        public bool         IsCapture;
+    }
 
     private struct MoveUndo
     {
         public ChessPiece     Captured;
-        public ChessPieceType MovedType;        // Original type before search-time promotion
-        public ChessPiece     EnPassantCapture; // Pawn removed for en passant
+        public ChessPieceType MovedType;
+        public ChessPiece     EnPassantCapture;
     }
+
+    // ══════════════════════════════════════
+    //  MEMORY BUFFERS (Cero GC en búsqueda)
+    // ══════════════════════════════════════
+    private Vector2Int[][] _killerMoves;    
+    private int[,,,]       _historyTable;   
+    
+    // Arrays preasignados por profundidad para evitar 'new List' en recursividad
+    private readonly List<Vector2Int[]>[] _plyMoveBuffers = new List<Vector2Int[]>[MAX_PLY];
+    private readonly List<ScoredMove>[]   _plyScoredBuffers = new List<ScoredMove>[MAX_PLY];
 
     // ══════════════════════════════════════
     //  ZOBRIST HASHING
     // ══════════════════════════════════════
-    private static readonly ulong[,,,] ZobristTable;  // [x][y][pieceIdx][team]
+    private static readonly ulong[,,,] ZobristTable; 
     private static readonly ulong      ZobristBlack;
 
     static ChessAI()
@@ -167,32 +164,36 @@ public class ChessAI : MonoBehaviour
         return BitConverter.ToUInt64(b, 0);
     }
 
-    // ══════════════════════════════════════
-    //  UNITY LIFECYCLE
-    // ══════════════════════════════════════
     private void Awake()
     {
-        if (Instance == null) Instance = this;
+        if (Instance == null) 
+        {
+            Instance = this;
+            // Inicializar buffers preasignados
+            for (int i = 0; i < MAX_PLY; i++)
+            {
+                _plyMoveBuffers[i] = new List<Vector2Int[]>(64);
+                _plyScoredBuffers[i] = new List<ScoredMove>(64);
+            }
+        }
         else Destroy(gameObject);
     }
 
     // ══════════════════════════════════════════════════════════
-    //  PUNTO DE ENTRADA  — misma firma que el original
+    //  PUNTO DE ENTRADA
     // ══════════════════════════════════════════════════════════
     public async Task<Vector2Int[]> GetBestMoveAsync(ChessPiece[,] board, int aiTeam, int difficultyLevel)
     {
         difficultyLevel = Mathf.Clamp(difficultyLevel, 1, 8);
 
-        // Niveles 1-2: MCTS con errores intencionados
         if (difficultyLevel <= 2)
             return await GetMoveViaMCTS(board, aiTeam, difficultyLevel);
 
-        // Niveles 3-8: Negamax con Iterative Deepening
         return await GetMoveViaNegamax(board, aiTeam, difficultyLevel);
     }
 
     // ══════════════════════════════════════════════════════════
-    //  MCTS — NIVELES 1 y 2 (principiante, comete errores)
+    //  MCTS — NIVELES 1 y 2
     // ══════════════════════════════════════════════════════════
     private async Task<Vector2Int[]> GetMoveViaMCTS(ChessPiece[,] board, int aiTeam, int level)
     {
@@ -225,10 +226,9 @@ public class ChessAI : MonoBehaviour
         int maxDepth   = NegamaxMaxDepth[level];
         int timeLimitMs = TimeLimitMs[level];
 
-        // Inicializar tablas heurísticas
-        int killerLen = maxDepth + 6;
+        int killerLen = MAX_PLY;
         _killerMoves  = new Vector2Int[killerLen][];
-        for (int i = 0; i < killerLen; i++) _killerMoves[i] = new Vector2Int[4]; // slot0_from, slot0_to, slot1_from, slot1_to
+        for (int i = 0; i < killerLen; i++) _killerMoves[i] = new Vector2Int[4]; 
         _historyTable = new int[2, 8, 8, 64];
 
         Vector2Int[] bestMove  = null;
@@ -237,7 +237,6 @@ public class ChessAI : MonoBehaviour
         var cts   = new CancellationTokenSource();
         var token = cts.Token;
 
-        // Cancelar la búsqueda cuando se acabe el tiempo
         _ = Task.Run(async () =>
         {
             await Task.Delay(timeLimitMs);
@@ -249,19 +248,15 @@ public class ChessAI : MonoBehaviour
             ChessPiece[,] searchBoard = CloneBoard(board);
             ulong rootHash = ComputeZobrist(searchBoard, aiTeam);
 
-            // Copia propia: GetOrderedMoves reutiliza un buffer interno durante la búsqueda
-            var rootMovesOrdered = GetOrderedMoves(searchBoard, aiTeam, 0, hash: rootHash);
-            if (rootMovesOrdered.Count == 0) return;
-            var rootMoves = new List<ScoredMove>(rootMovesOrdered);
+            var rootMoves = GetOrderedMoves(searchBoard, aiTeam, 0, rootHash);
+            if (rootMoves.Count == 0) return;
 
             bestMove = rootMoves[0].Move;
 
-            // Iterative Deepening: de 1 hasta maxDepth
             for (int depth = 1; depth <= maxDepth; depth++)
             {
                 if (token.IsCancellationRequested) break;
 
-                // Aspiration windows para depth ≥ 3
                 float alpha, beta;
                 if (depth >= 3 && bestScore > -MATE_SCORE + 2000 && bestScore < MATE_SCORE - 2000)
                 {
@@ -290,16 +285,21 @@ public class ChessAI : MonoBehaviour
 
                         var entry = rootMoves[mi];
                         ulong nextHash = UpdateZobrist(rootHash, searchBoard, entry.Move, aiTeam);
+                        
+                        // Check Extension Local (Detectamos captura del rey virtualmente)
+                        int extension = IsKingAttacked(searchBoard, 1 - aiTeam, entry.Move) ? 1 : 0;
+                        int nextDepth = depth - 1 + extension;
+
                         MakeMove(searchBoard, entry.Move, out var undo);
 
                         float score;
                         if (mi == 0)
-                            score = -Search(searchBoard, depth - 1, -beta, -alpha, 1 - aiTeam, 1, nextHash, token);
+                            score = -Search(searchBoard, nextDepth, -beta, -alpha, 1 - aiTeam, 1, nextHash, token);
                         else
                         {
-                            score = -Search(searchBoard, depth - 1, -alpha - 1, -alpha, 1 - aiTeam, 1, nextHash, token);
+                            score = -Search(searchBoard, nextDepth, -alpha - 1, -alpha, 1 - aiTeam, 1, nextHash, token);
                             if (score > alpha && score < beta)
-                                score = -Search(searchBoard, depth - 1, -beta, -alpha, 1 - aiTeam, 1, nextHash, token);
+                                score = -Search(searchBoard, nextDepth, -beta, -alpha, 1 - aiTeam, 1, nextHash, token);
                         }
 
                         UnmakeMove(searchBoard, entry.Move, undo);
@@ -313,7 +313,6 @@ public class ChessAI : MonoBehaviour
                         if (alpha >= beta) break;
                     }
 
-                    // Fallo de aspiration window → ventana completa y repetir
                     if (iterBest <= alpha - 60f || iterBest >= beta - 60f)
                     {
                         alpha = -MATE_SCORE;
@@ -328,10 +327,9 @@ public class ChessAI : MonoBehaviour
                     bestScore = iterBest;
                     bestMove  = iterBestMove;
                     PromoteRootMove(rootMoves, iterBestMove);
-                    Debug.Log($"[ChessAI Lvl{level}] Depth {depth} | Score {bestScore:F0} | {bestMove[0]}→{bestMove[1]}");
                 }
 
-                if (Mathf.Abs(bestScore) > MATE_SCORE - 1000) break; // Mate encontrado
+                if (Mathf.Abs(bestScore) > MATE_SCORE - 1000) break;
             }
         }, CancellationToken.None);
 
@@ -340,18 +338,17 @@ public class ChessAI : MonoBehaviour
     }
 
     // ══════════════════════════════════════════════════════════
-    //  NEGAMAX ALPHA-BETA CON TODAS LAS OPTIMIZACIONES
+    //  BÚSQUEDA RECURSIVA PRINCIPAL
     // ══════════════════════════════════════════════════════════
     private float Search(ChessPiece[,] board, int depth, float alpha, float beta,
                          int turn, int ply, ulong hash, CancellationToken token)
     {
         if (token.IsCancellationRequested) return 0f;
+        if (ply >= MAX_PLY) return StaticEval(board, turn);
 
-        // Detección de mate
         if (IsKingDead(board, 0)) return turn == 1 ?  (MATE_SCORE - ply) : -(MATE_SCORE - ply);
         if (IsKingDead(board, 1)) return turn == 0 ?  (MATE_SCORE - ply) : -(MATE_SCORE - ply);
 
-        // ── TRANSPOSITION TABLE ───────────────────────────────
         int     ttIdx   = (int)((hash & 0x7FFFFFFF) % TT_SIZE);
         ref TTEntry tte = ref _tt[ttIdx];
         if (tte.Hash == hash && tte.Depth >= depth)
@@ -363,12 +360,13 @@ public class ChessAI : MonoBehaviour
             if (alpha >= beta) return ts;
         }
 
-        // ── QUIESCENCE EN HOJA ────────────────────────────────
-        if (depth == 0)
-            return QuiescenceSearch(board, alpha, beta, QUIESCENCE_DEPTH, turn, hash);
+        if (depth <= 0)
+            return QuiescenceSearch(board, alpha, beta, QUIESCENCE_DEPTH, turn, ply, hash);
 
-        // ── NULL MOVE PRUNING ─────────────────────────────────
-        bool endgame = IsEndgame(board);
+        // NMP requiere evaluar fase de juego
+        int gamePhase = CalculatePhase(board);
+        bool endgame = gamePhase <= 6; 
+
         if (!endgame && depth >= 3 && ply > 0 && beta < MATE_SCORE - 1000)
         {
             float nullScore = -Search(board, depth - 1 - NULL_MOVE_R, -beta, -beta + 1,
@@ -376,7 +374,6 @@ public class ChessAI : MonoBehaviour
             if (nullScore >= beta) return beta;
         }
 
-        // ── OBTENER Y ORDENAR MOVIMIENTOS ────────────────────
         var moves = GetOrderedMoves(board, turn, ply, hash);
         if (moves.Count == 0) return DRAW_SCORE;
 
@@ -390,36 +387,39 @@ public class ChessAI : MonoBehaviour
             if (token.IsCancellationRequested) return 0f;
 
             ulong nextHash = UpdateZobrist(hash, board, entry.Move, turn);
+            
+            // Check Extension
+            int extension = IsKingAttacked(board, 1 - turn, entry.Move) ? 1 : 0;
+            int nextDepth = depth - 1 + extension;
+
             MakeMove(board, entry.Move, out var undo);
             bool isCapture = entry.IsCapture;
 
             float score;
 
-            // ── LATE MOVE REDUCTIONS (LMR) + PVS ─────────────────
             if (moveCount == 0)
             {
-                score = -Search(board, depth - 1, -beta, -alpha, 1 - turn, ply + 1, nextHash, token);
+                score = -Search(board, nextDepth, -beta, -alpha, 1 - turn, ply + 1, nextHash, token);
             }
-            else if (!isCapture && depth >= LMR_MIN_DEPTH && moveCount >= LMR_MIN_MOVES)
+            else if (!isCapture && extension == 0 && depth >= LMR_MIN_DEPTH && moveCount >= LMR_MIN_MOVES)
             {
                 int r = 1;
                 if (moveCount >= 6) r++;
                 if (depth   >= 7)   r++;
-                int reduced = Mathf.Max(depth - 1 - r, 0);
+                int reduced = Mathf.Max(nextDepth - r, 0);
 
                 score = -Search(board, reduced, -alpha - 1, -alpha, 1 - turn, ply + 1, nextHash, token);
                 if (score > alpha && score < beta)
-                    score = -Search(board, depth - 1, -beta, -alpha, 1 - turn, ply + 1, nextHash, token);
+                    score = -Search(board, nextDepth, -beta, -alpha, 1 - turn, ply + 1, nextHash, token);
             }
             else
             {
-                score = -Search(board, depth - 1, -alpha - 1, -alpha, 1 - turn, ply + 1, nextHash, token);
+                score = -Search(board, nextDepth, -alpha - 1, -alpha, 1 - turn, ply + 1, nextHash, token);
                 if (score > alpha && score < beta)
-                    score = -Search(board, depth - 1, -beta, -alpha, 1 - turn, ply + 1, nextHash, token);
+                    score = -Search(board, nextDepth, -beta, -alpha, 1 - turn, ply + 1, nextHash, token);
             }
 
             UnmakeMove(board, entry.Move, undo);
-
             moveCount++;
 
             if (score > best)
@@ -432,7 +432,6 @@ public class ChessAI : MonoBehaviour
                 alpha = score;
                 flag  = 0;
 
-                // Actualizar history heuristic
                 if (!isCapture && _historyTable != null)
                 {
                     int toIdx = entry.Move[1].x * 8 + entry.Move[1].y;
@@ -443,7 +442,6 @@ public class ChessAI : MonoBehaviour
 
             if (alpha >= beta)
             {
-                // Guardar killer move
                 if (!isCapture && ply < _killerMoves.Length)
                 {
                     _killerMoves[ply][2] = _killerMoves[ply][0];
@@ -457,7 +455,6 @@ public class ChessAI : MonoBehaviour
             }
         }
 
-        // Guardar en TT
         var ttMove = bestMoveLocal;
         _tt[ttIdx] = new TTEntry
         {
@@ -471,27 +468,31 @@ public class ChessAI : MonoBehaviour
     }
 
     // ══════════════════════════════════════════════════════════
-    //  QUIESCENCE SEARCH
+    //  QUIESCENCE SEARCH (GC Free)
     // ══════════════════════════════════════════════════════════
     private float QuiescenceSearch(ChessPiece[,] board, float alpha, float beta,
-                                   int depth, int turn, ulong hash)
+                                   int depth, int turn, int ply, ulong hash)
     {
-        float standPat = StaticEval(board, turn, includeMobility: depth == QUIESCENCE_DEPTH);
+        if (ply >= MAX_PLY) return StaticEval(board, turn);
+
+        float standPat = StaticEval(board, turn);
         if (standPat >= beta) return beta;
         if (standPat > alpha) alpha = standPat;
         if (depth == 0)       return alpha;
 
         const float DELTA = 200f;
 
-        // Allocate a fresh list here to avoid corrupting the shared buffer in recursive calls
-        var allMoves = new List<Vector2Int[]>(GetAllRawMoves(board, turn));
-        var localScored = new List<ScoredMove>(allMoves.Count);
+        var allMoves = GenerateMovesLocal(board, turn, ply);
+        var localScored = _plyScoredBuffers[ply];
+        localScored.Clear();
+
         for (int i = 0; i < allMoves.Count; i++)
         {
             var move = allMoves[i];
             ChessPiece vic = board[move[1].x, move[1].y];
-            if (vic == null) continue;
+            if (vic == null) continue; // Solo nos importan las capturas
             ChessPiece att = board[move[0].x, move[0].y];
+            
             localScored.Add(new ScoredMove
             {
                 Move = move, IsCapture = true,
@@ -505,12 +506,11 @@ public class ChessAI : MonoBehaviour
             var move = localScored[ci].Move;
             ChessPiece vic = board[move[1].x, move[1].y];
 
-            // Delta pruning
             if (standPat + PieceVal(vic.type) + DELTA < alpha) continue;
 
             ulong nextHash = UpdateZobrist(hash, board, move, turn);
             MakeMove(board, move, out var undo);
-            float score = -QuiescenceSearch(board, -beta, -alpha, depth - 1, 1 - turn, nextHash);
+            float score = -QuiescenceSearch(board, -beta, -alpha, depth - 1, 1 - turn, ply + 1, nextHash);
             UnmakeMove(board, move, undo);
 
             if (score >= beta) return beta;
@@ -520,22 +520,24 @@ public class ChessAI : MonoBehaviour
     }
 
     // ══════════════════════════════════════════════════════════
-    //  EVALUACIÓN ESTÁTICA
+    //  EVALUACIÓN ESTÁTICA TAPERED Y KING SAFETY
     // ══════════════════════════════════════════════════════════
-    private float StaticEval(ChessPiece[,] board, int side, bool includeMobility)
+    private float StaticEval(ChessPiece[,] board, int side)
     {
         if (IsKingDead(board, 0)) return side == 1 ?  MATE_SCORE : -MATE_SCORE;
         if (IsKingDead(board, 1)) return side == 0 ?  MATE_SCORE : -MATE_SCORE;
 
-        bool endgame = IsEndgame(board);
-        float score = 0f;
+        int phase = CalculatePhase(board);
+        float mgWeight = Mathf.Min(phase, 24) / 24f;
+        float egWeight = 1f - mgWeight;
+
+        float mgScore = 0f;
+        float egScore = 0f;
 
         int[] pawnsPerFileW = new int[8];
         int[] pawnsPerFileB = new int[8];
-        int[] lastWPawnRank = new int[8];
-        int[] lastBPawnRank = new int[8];
-        for (int i = 0; i < 8; i++) { lastWPawnRank[i] = -1; lastBPawnRank[i] = 8; }
 
+        int wKingX = -1, wKingY = -1, bKingX = -1, bKingY = -1;
         int wBishops = 0, bBishops = 0;
 
         for (int x = 0; x < 8; x++)
@@ -547,77 +549,72 @@ public class ChessAI : MonoBehaviour
 
                 int pv      = PieceVal(p.type);
                 int tableY  = p.team == 0 ? y : 7 - y;
-                int psqt    = GetPSQT(p.type, tableY, x, endgame);
+                
+                float valMg = pv + GetPSQT(p.type, tableY, x, false);
+                float valEg = pv + GetPSQT(p.type, tableY, x, true);
 
-                float pieceScore = pv + psqt;
-                score += p.team == side ? pieceScore : -pieceScore;
+                if (p.team == 0) { mgScore += valMg; egScore += valEg; }
+                else             { mgScore -= valMg; egScore -= valEg; }
 
                 if (p.type == ChessPieceType.Pawn)
                 {
-                    if (p.team == 0)
-                    {
-                        pawnsPerFileW[x]++;
-                        if (y > lastWPawnRank[x]) lastWPawnRank[x] = y;
-                    }
-                    else
-                    {
-                        pawnsPerFileB[x]++;
-                        if (y < lastBPawnRank[x]) lastBPawnRank[x] = y;
-                    }
+                    if (p.team == 0) pawnsPerFileW[x]++;
+                    else             pawnsPerFileB[x]++;
                 }
-                if (p.type == ChessPieceType.Bishop)
-                { if (p.team == 0) wBishops++; else bBishops++; }
-            }
-        }
-
-        if (wBishops >= 2) score += (side == 0 ?  30f : -30f);
-        if (bBishops >= 2) score += (side == 1 ?  30f : -30f);
-
-        for (int f = 0; f < 8; f++)
-        {
-            if (pawnsPerFileW[f] > 1) score += (side == 0 ? -20f : 20f) * (pawnsPerFileW[f] - 1);
-            if (pawnsPerFileB[f] > 1) score += (side == 1 ? -20f : 20f) * (pawnsPerFileB[f] - 1);
-
-            bool wLeft  = f > 0 && pawnsPerFileW[f-1] > 0;
-            bool wRight = f < 7 && pawnsPerFileW[f+1] > 0;
-            if (pawnsPerFileW[f] > 0 && !wLeft && !wRight) score += (side == 0 ? -15f : 15f);
-
-            bool bLeft  = f > 0 && pawnsPerFileB[f-1] > 0;
-            bool bRight = f < 7 && pawnsPerFileB[f+1] > 0;
-            if (pawnsPerFileB[f] > 0 && !bLeft && !bRight) score += (side == 1 ? -15f : 15f);
-
-            if (lastWPawnRank[f] >= 0)
-            {
-                int wRank = lastWPawnRank[f];
-                bool passed = true;
-                for (int adj = Mathf.Max(0, f-1); adj <= Mathf.Min(7, f+1); adj++)
+                else if (p.type == ChessPieceType.Bishop)
                 {
-                    if (pawnsPerFileB[adj] > 0 && lastBPawnRank[adj] < wRank)
-                    { passed = false; break; }
+                    if (p.team == 0) wBishops++; else bBishops++;
                 }
-                if (passed) score += (side == 0 ? 1f : -1f) * (20f + wRank * 10f);
-            }
-            if (lastBPawnRank[f] < 8)
-            {
-                int bRank = 7 - lastBPawnRank[f];
-                bool passed = true;
-                for (int adj = Mathf.Max(0, f-1); adj <= Mathf.Min(7, f+1); adj++)
+                else if (p.type == ChessPieceType.King)
                 {
-                    if (pawnsPerFileW[adj] > 0 && lastWPawnRank[adj] > 7 - lastBPawnRank[f])
-                    { passed = false; break; }
+                    if (p.team == 0) { wKingX = x; wKingY = y; }
+                    else             { bKingX = x; bKingY = y; }
                 }
-                if (passed) score += (side == 1 ? 1f : -1f) * (20f + bRank * 10f);
             }
         }
 
-        if (includeMobility)
-        {
-            int mobUs   = GetAllRawMoves(board, side).Count;
-            int mobThem = GetAllRawMoves(board, 1 - side).Count;
-            score += (mobUs - mobThem) * 3f;
-        }
+        // Pareja de Alfiles
+        if (wBishops >= 2) { mgScore += 30f; egScore += 30f; }
+        if (bBishops >= 2) { mgScore -= 30f; egScore -= 30f; }
 
-        return score;
+        // King Safety (Solo relevante en Midgame)
+        float kingSafetyScore = 0f;
+        if (wKingX >= 0) kingSafetyScore += EvalKingSafety(wKingX, wKingY, 0, pawnsPerFileW, pawnsPerFileB);
+        if (bKingX >= 0) kingSafetyScore -= EvalKingSafety(bKingX, bKingY, 1, pawnsPerFileB, pawnsPerFileW);
+        mgScore += kingSafetyScore;
+
+        float score = (mgScore * mgWeight) + (egScore * egWeight);
+        return side == 0 ? score : -score;
+    }
+
+    private int CalculatePhase(ChessPiece[,] board)
+    {
+        int phase = 0;
+        for (int x = 0; x < 8; x++)
+            for (int y = 0; y < 8; y++)
+            {
+                ChessPiece p = board[x, y];
+                if (p == null || p.type == ChessPieceType.Pawn || p.type == ChessPieceType.King) continue;
+                if (p.type == ChessPieceType.Knight || p.type == ChessPieceType.Bishop) phase += 1;
+                else if (p.type == ChessPieceType.Rook) phase += 2;
+                else if (p.type == ChessPieceType.Queen) phase += 4;
+            }
+        return phase;
+    }
+
+    private float EvalKingSafety(int kx, int ky, int team, int[] myPawns, int[] enemyPawns)
+    {
+        float safety = 0f;
+        // Castling columns: Evaluar el escudo de peones
+        int startX = Mathf.Max(0, kx - 1);
+        int endX   = Mathf.Min(7, kx + 1);
+
+        for (int x = startX; x <= endX; x++)
+        {
+            if (myPawns[x] == 0) safety -= 15f; // Falta peón escudo
+            if (enemyPawns[x] == 0 && myPawns[x] == 0) safety -= 25f; // Columna totalmente abierta al rey
+        }
+        return safety;
     }
 
     private int GetPSQT(ChessPieceType type, int tableY, int x, bool endgame) => type switch
@@ -642,36 +639,16 @@ public class ChessAI : MonoBehaviour
                 float v = PieceVal(p.type);
                 score += p.team == side ? v : -v;
             }
-        return score / 20000f; // normalizado [-1,1] para MCTS
-    }
-
-    private bool IsEndgame(ChessPiece[,] board)
-    {
-        int queens = 0, total = 0;
-        for (int x = 0; x < 8; x++)
-            for (int y = 0; y < 8; y++)
-            {
-                if (board[x, y] == null) continue;
-                total++;
-                if (board[x, y].type == ChessPieceType.Queen) queens++;
-            }
-        return queens == 0 || total <= 14;
+        return score / 20000f; 
     }
 
     // ══════════════════════════════════════════════════════════
-    //  ORDENAMIENTO DE MOVIMIENTOS
+    //  ORDENAMIENTO Y GENERACIÓN (GC FREE)
     // ══════════════════════════════════════════════════════════
-    private struct ScoredMove
-    {
-        public Vector2Int[] Move;
-        public float        Score;
-        public bool         IsCapture;
-    }
-
     private List<ScoredMove> GetOrderedMoves(ChessPiece[,] board, int team, int ply, ulong hash)
     {
-        var raw     = GetAllRawMoves(board, team);
-        var scored  = _scoredMoveBuffer;
+        var raw     = GenerateMovesLocal(board, team, ply);
+        var scored  = _plyScoredBuffers[ply];
         scored.Clear();
         var killers = (ply < _killerMoves?.Length) ? _killerMoves[ply] : null;
 
@@ -712,16 +689,35 @@ public class ChessAI : MonoBehaviour
                     int toIdx = move[1].x * 8 + move[1].y;
                     score += _historyTable[team, move[0].x, move[0].y, toIdx];
                 }
-
-                if (att.type == ChessPieceType.Pawn && (move[1].y == 7 || move[1].y == 0))
-                    score = Mathf.Max(score, 8500f);
             }
 
             scored.Add(new ScoredMove { Move = move, Score = score, IsCapture = isCapture });
         }
 
         scored.Sort((a, b) => b.Score.CompareTo(a.Score));
-        return new List<ScoredMove>(scored);
+        return scored;
+    }
+
+    private List<Vector2Int[]> GenerateMovesLocal(ChessPiece[,] board, int team, int ply)
+    {
+        var buffer = _plyMoveBuffers[ply];
+        buffer.Clear();
+        
+        for (int x = 0; x < 8; x++)
+            for (int y = 0; y < 8; y++)
+            {
+                ChessPiece p = board[x, y];
+                if (p == null || p.team != team) continue;
+                
+                // Nota: GetAvailableMoves aún genera un poco de GC interno en ChessPiece,
+                // Pero lo estamos aislando lo máximo posible.
+                var targets = p.GetAvailableMoves(ref board, 8, 8);
+                if (targets == null) continue;
+                
+                for(int i = 0; i < targets.Count; i++)
+                    buffer.Add(new[] { new Vector2Int(x, y), targets[i] });
+            }
+        return buffer;
     }
 
     // ══════════════════════════════════════════════════════════
@@ -768,7 +764,7 @@ public class ChessAI : MonoBehaviour
     };
 
     // ══════════════════════════════════════════════════════════
-    //  MCTS AUXILIAR
+    //  MCTS AUXILIAR (Niveles 1-2)
     // ══════════════════════════════════════════════════════════
     private MCTSNode SelectPUCT(MCTSNode node)
     {
@@ -785,7 +781,7 @@ public class ChessAI : MonoBehaviour
 
     private void ExpandMCTS(MCTSNode node)
     {
-        var moves = GetAllRawMoves(node.BoardState, node.TeamTurn);
+        var moves = GenerateMovesLocal(node.BoardState, node.TeamTurn, 63); // Usamos ply final para buffer seguro
         if (moves.Count == 0) return;
 
         float[] scores = new float[moves.Count];
@@ -820,7 +816,7 @@ public class ChessAI : MonoBehaviour
     }
 
     // ══════════════════════════════════════════════════════════
-    //  HELPERS TABLERO
+    //  HELPERS DE MOVIMIENTO
     // ══════════════════════════════════════════════════════════
     private int PieceVal(ChessPieceType t) => t switch
     {
@@ -832,22 +828,6 @@ public class ChessAI : MonoBehaviour
         ChessPieceType.King   => 20000,
         _                     => 0
     };
-
-    private List<Vector2Int[]> GetAllRawMoves(ChessPiece[,] board, int team)
-    {
-        _rawMoveBuffer.Clear();
-        for (int x = 0; x < 8; x++)
-            for (int y = 0; y < 8; y++)
-            {
-                ChessPiece p = board[x, y];
-                if (p == null || p.team != team) continue;
-                var targets = p.GetAvailableMoves(ref board, 8, 8);
-                if (targets == null) continue;
-                foreach (var t in targets)
-                    _rawMoveBuffer.Add(new[] { new Vector2Int(x, y), t });
-            }
-        return _rawMoveBuffer;
-    }
 
     private static void MakeMove(ChessPiece[,] board, Vector2Int[] move, out MoveUndo undo)
     {
@@ -866,13 +846,11 @@ public class ChessAI : MonoBehaviour
 
             if (moving.type == ChessPieceType.Pawn)
             {
-                // En passant: diagonal pawn capture onto an empty square
                 if (move[0].x != move[1].x && undo.Captured == null)
                 {
                     undo.EnPassantCapture = board[move[1].x, move[0].y];
                     board[move[1].x, move[0].y] = null;
                 }
-                // Promotion: temporarily treat the pawn as a queen for evaluation
                 else if ((moving.team == 0 && move[1].y == 7) ||
                          (moving.team == 1 && move[1].y == 0))
                 {
@@ -892,14 +870,13 @@ public class ChessAI : MonoBehaviour
         {
             moved.currentX = move[0].x;
             moved.currentY = move[0].y;
-            moved.type     = undo.MovedType; // Restore type in case of promotion swap
+            moved.type     = undo.MovedType; 
         }
         if (undo.Captured != null)
         {
             undo.Captured.currentX = move[1].x;
             undo.Captured.currentY = move[1].y;
         }
-        // Restore en-passant captured pawn
         if (undo.EnPassantCapture != null)
         {
             board[move[1].x, move[0].y]       = undo.EnPassantCapture;
@@ -946,11 +923,28 @@ public class ChessAI : MonoBehaviour
                     return false;
         return true;
     }
+
+    private bool IsKingAttacked(ChessPiece[,] board, int targetTeam, Vector2Int[] lastMove)
+    {
+        // Detectar si el movimiento previo está atacando al rey (Extensión de Jaque)
+        ChessPiece attacker = board[lastMove[1].x, lastMove[1].y];
+        if (attacker == null) return false;
+
+        // Recuperar movimientos disponibles de la pieza que acaba de moverse
+        var attackTargets = attacker.GetAvailableMoves(ref board, 8, 8);
+        if (attackTargets == null) return false;
+
+        for (int i = 0; i < attackTargets.Count; i++)
+        {
+            Vector2Int pos = attackTargets[i];
+            ChessPiece p = board[pos.x, pos.y];
+            if (p != null && p.type == ChessPieceType.King && p.team == targetTeam)
+                return true;
+        }
+        return false;
+    }
 }
 
-// ══════════════════════════════════════════════════════════
-//  NODO MCTS  (solo para niveles 1-2)
-// ══════════════════════════════════════════════════════════
 public class MCTSNode
 {
     public ChessPiece[,]   BoardState;

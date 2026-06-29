@@ -6,7 +6,7 @@ using UnityEngine;
 
 public class Server : MonoBehaviour
 {
-     #region Singleton implementation
+    #region Singleton implementation
     public static Server Instance { set; get; }
     private void Awake()
     {
@@ -15,6 +15,7 @@ public class Server : MonoBehaviour
     #endregion
 
     public NetworkDriver driver;
+    private NetworkPipeline reliablePipeline;
     private NativeList<NetworkConnection> connections;
 
     private bool isActive = false;
@@ -27,6 +28,7 @@ public class Server : MonoBehaviour
     public void Init(ushort port)
     {
         driver = NetworkDriver.Create();
+        reliablePipeline = driver.CreatePipeline(typeof(ReliableSequencedPipelineStage));
         NetworkEndpoint endpoint = NetworkEndpoint.AnyIpv4;
         endpoint.Port = port;
 
@@ -54,7 +56,7 @@ public class Server : MonoBehaviour
     }
     public void OnDestroy()
     {
-        ShutDown();       
+        ShutDown();
     }
 
     public void Update()
@@ -103,7 +105,7 @@ public class Server : MonoBehaviour
         for (int i = 0; i < connections.Length; i++)
         {
             NetworkEvent.Type cmd;
-            while ((cmd = driver.PopEventForConnection(connections[i], out stream)) != NetworkEvent.Type.Empty) 
+            while ((cmd = driver.PopEventForConnection(connections[i], out stream)) != NetworkEvent.Type.Empty)
             {
                 if (cmd == NetworkEvent.Type.Data)
                 {
@@ -111,8 +113,9 @@ public class Server : MonoBehaviour
                 }
                 else if (cmd == NetworkEvent.Type.Disconnect)
                 {
-                    Debug.Log("Client disconnected from server");
+                    Debug.Log("Cliente desconectado");
                     connections[i] = default(NetworkConnection);
+                    Broadcast(new NetRematch() { teamId = 1, wantRematch = 0 }); //
                     connectionDropped?.Invoke();
                     ShutDown();
                 }
@@ -124,7 +127,7 @@ public class Server : MonoBehaviour
     public void SendToClient(NetworkConnection connection, NetMessage msg)
     {
         DataStreamWriter writer;
-        driver.BeginSend(connection, out writer);
+        driver.BeginSend(reliablePipeline, connection, out writer);
         msg.Serialize(ref writer);
         driver.EndSend(writer);
     }

@@ -15,6 +15,7 @@ public class Client : MonoBehaviour
 
     public NetworkDriver driver;
     private NetworkConnection connection;
+    private NetworkPipeline reliablePipeline;
 
     private bool isActive = false;
 
@@ -24,6 +25,7 @@ public class Client : MonoBehaviour
     {
         driver = NetworkDriver.Create();
         NetworkEndpoint endpoint = NetworkEndpoint.Parse(ip, port);
+        reliablePipeline = driver.CreatePipeline(typeof(ReliableSequencedPipelineStage));
 
         connection = driver.Connect(endpoint);
 
@@ -94,7 +96,7 @@ public class Client : MonoBehaviour
     public void SendToServer(NetMessage msg)
     {
         DataStreamWriter writer;
-        driver.BeginSend(connection, out writer);
+        driver.BeginSend(reliablePipeline, connection, out writer);
         msg.Serialize(ref writer);
         driver.EndSend(writer);
     }
