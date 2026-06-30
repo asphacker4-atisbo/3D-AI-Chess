@@ -523,6 +523,8 @@ public class Chessboard : MonoBehaviour
         GameObject pieceObj = Instantiate(prefabs[(int)type - 1]);
         ChessPiece cp = pieceObj.GetComponent<ChessPiece>();
 
+        Debug.Log($"Created {pieceObj.name} at {pieceObj.transform.position}. Active: {pieceObj.activeInHierarchy}");
+
         cp.transform.SetParent(transform);
         cp.transform.localScale = prefabs[(int)type - 1].transform.localScale;
 
